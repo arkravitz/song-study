@@ -1,0 +1,50 @@
+# ---- secrets ----
+.env
+.env.*
+!.env.example
+*.key
+secrets/
+
+# ---- python ----
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- analysis artifacts (large binaries, derived data) ----
+# data/stems is ~1.9 GB and data/models ~600 MB after a few songs. None of it
+# is source: everything here is re-derivable from the audio plus the config.
+data/uploads/
+data/cache/
+data/analyses/
+data/backups/
+data/models/
+data/stems/
+data/tmp/
+*.ckpt
+*.pth
+*.onnx
+*.safetensors
+
+# ---- node / frontend ----
+node_modules/
+frontend/dist/
+frontend/.vite/
+*.tsbuildinfo
+npm-debug.log*
+yarn-error.log*
+
+# ---- os ----
+.DS_Store
+Thumbs.db
+
+# Publication excludes local hosting and developer state
+.openai/
+.cache/
+.pytest_cache/
+.demo-data/
+.demo-venv/
