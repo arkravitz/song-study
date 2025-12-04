@@ -1,0 +1,41 @@
+name: Checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    env:
+      ARRANGEMENT_ALLOW_DOWNLOAD: '0'
+      ARRANGEMENT_DEVICE: cpu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - run: pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install -e '.[dev]'
+      - run: pytest backend/tests desktop/worker/tests -q
+      - run: python examples/create_demo.py
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+  native:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift test --package-path desktop
+      - run: swift build --package-path desktop -c release
