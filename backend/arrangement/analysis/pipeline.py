@@ -881,3 +881,630 @@ def _silent_stem_caveats(analysis) -> list[str]:
     ]
 
 
+def _structure_caveats(analysis, st) -> list[str]:
+    """Caveats about the structure, computed where the structure is final.
+
+    Repeat grouping happens here, not in `analyse_structure`, because grouping
+    needs each section's measured arrangement profile. Any note about repeats
+    therefore has to be written here too: emitted from the DSP layer it is
+    evaluated before grouping and always claims there are no repeats.
+    """
+    out: list[str] = []
+    secs = analysis.sections
+    if len(secs) < 3:
+        return out
+
+    groups: dict[object, list] = {}
+    for s in secs:
+        groups.setdefault(s.repeat_group, []).append(s)
+    multi = [k for k, v in groups.items() if len(v) > 1]
+
+    if not multi:
+        out.append(
+            "no two sections were recognised as repeats; treat the section list as a "
+            "sequence of distinct passages rather than verse/chorus form"
+        )
+    else:
+        # Say which passages repeat and how often, rather than a bare "some
+        # sections repeat" that tells the user nothing they cannot see.
+        biggest = max(multi, key=lambda k: len(groups[k]))
+        n = len(groups[biggest])
+        names = sorted({groups[k][0].label.value for k in multi})
+        # "3 passage(s) repeat" is what a template emits when nobody decided what
+        # one should say. Prose is not expensive and the plural is not a guess:
+        # there is a count, and the count is either one or not.
+        n_groups = len(multi)
+        noun = "passage repeats" if n_groups == 1 else "passages repeat"
+        out.append(
+            f"{n_groups} {noun}; the most repeated is "
+            f"{groups[biggest][0].label.value} ×{n} "
+            f"({', '.join(f'{g.start:.0f}s' for g in groups[biggest])})"
+            + (f". Repeats carry the names: {', '.join(names)}" if len(names) > 1 else "")
+        )
+
+    # A formal section that runs long is almost always several sections the
+    # boundary detector failed to split. 15% of the record is the threshold
+    # rather than 20% because a pop record's final section routinely contains a
+    # chorus *and* an outro, and at 20% that merged tail went unreported.
+    dur = analysis.duration or 1.0
+    longs = [s for s in secs if (s.end - s.start) > 0.15 * dur]
+    for s in longs[:4]:
+        out.append(
+            f"the section at {s.start:.0f}s runs {s.end - s.start:.0f}s "
+            f"({(s.end - s.start) / dur:.0%} of the record) — long enough to contain "
+            f"more than one formal section, so treat it as a span, not a single one"
+        )
+
+    # The closing section, when it is both long and part of a repeating chorus
+    # group, very often runs straight into an outro that was not split out. Flag
+    # the possibility rather than inventing the label: the analysis cannot tell a
+    # held final chorus from a chorus that decays into an outro without a
+    # boundary, and guessing is how "chorus" ends up covering the last 27
+    # seconds of a record.
+    last = secs[-1]
+    if (last.end >= dur - 0.75 and (last.end - last.start) > 0.12 * dur
+            and len(groups.get(last.repeat_group, [last])) > 1):
+        out.append(
+            f"the final section shares a name with earlier repeats and runs "
+            f"{last.end - last.start:.0f}s, so an outro may be folded into it — "
+            f"nothing in the measurements separates a held chorus from a fade"
+        )
+
+    # Coherence of each multi-member group. A group whose members differ a lot in
+    # level, or in which the vocal appears in some occurrences and not others, is
+    # not a confident repeat — it is two different passages that happened to
+    # score above the similarity cut. On a sparse, boom-bap record with one
+    # instrumentation throughout, that happens easily: verse and chorus share
+    # every instrument and differ only in density.
+    for k, members in groups.items():
+        if len(members) < 2:
+            continue
+        es = [m.energy_perceived for m in members]
+        spread = max(es) - min(es)
+        voc = [bool(set(m.source_ids) & {"vocals"}) for m in members]
+        label = members[0].label.value
+        if spread > 0.14:
+            out.append(
+                f"the {len(members)} sections grouped as “{label}” differ in level by "
+                f"{spread:.2f} ({', '.join(f'{e:.2f}' for e in es)}) — the grouping is "
+                f"probably too coarse, so treat the shared name as tentative"
+            )
+        elif 0 < sum(voc) < len(voc):
+            missing = [f"{m.start:.0f}s" for m, v in zip(members, voc) if not v]
+            out.append(
+                f"“{label}” is sung in some occurrences and not others "
+                f"(no vocal at {', '.join(missing)}) — it may be two different "
+                f"passages sharing a name"
+            )
+
+    # A section that is neither the loudest nor the quietest, in the middle of
+    # the record, with the fewest sources playing, is usually a breakdown the
+    # labeller read as an outro or a bridge purely from its position.
+    if len(secs) >= 5:
+        quiet = sorted(secs, key=lambda s: s.energy_perceived)
+        for s in quiet[:2]:
+            mid = 0.15 < (s.start / dur) < 0.85
+            if mid and s.source_count <= 1 and s.label.value in ("outro", "intro", "chorus"):
+                out.append(
+                    f"the section at {s.start:.0f}s is named “{s.label.value}” but sits "
+                    f"{s.start / dur:.0%} into the record with {s.source_count} source(s) "
+                    f"playing — that is a breakdown, and the name is a position guess"
+                )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Section naming
+# ---------------------------------------------------------------------------
+
+#: Where each label sits, so alternatives can be ordered sensibly in the UI.
+_LABEL_PRIOR: dict[SectionLabel, float] = {
+    SectionLabel.INTRO: 0.02,
+    SectionLabel.OUTRO: 0.02,
+    SectionLabel.VERSE: 0.10,
+    SectionLabel.CHORUS: 0.10,
+    SectionLabel.PRE_CHORUS: 0.14,
+    SectionLabel.POST_CHORUS: 0.18,
+    SectionLabel.BRIDGE: 0.18,
+    SectionLabel.BREAKDOWN: 0.22,
+    SectionLabel.INSTRUMENTAL: 0.16,
+    SectionLabel.SOLO: 0.22,
+    SectionLabel.INTERLUDE: 0.24,
+    SectionLabel.DROP: 0.20,
+    SectionLabel.TAG: 0.24,
+    SectionLabel.FADE: 0.28,
+    SectionLabel.UNKNOWN: 0.5,
+}
+
+
+def merge_macro_sections(analysis) -> None:
+    """Collapse adjacent same-label sections into numbered macro sections.
+
+    Boundary detection and section interpretation are different jobs, and this is
+    the seam between them. A chorus whose arrangement thickens for the last four
+    bars is one chorus with an internal change; the boundary detector correctly
+    reports a boundary, and turning that boundary into a second top-level
+    "chorus" is the mistake.
+
+    Two adjacent segments merge when they ended up with the same name. They are
+    not *deleted*: the individual segments keep their identity, their ids and
+    their times, and their internal boundary still appears on the arrangement
+    layer. Only the top-level section list changes, because that is the thing a
+    producer reads as form.
+
+    A section that arrives with no name at all is left alone rather than merged
+    into its neighbour: an unknown is honest, and absorbing it would hide the
+    fact that we do not know what it is.
+    """
+    secs = sorted(analysis.sections, key=lambda s: s.start)
+    if len(secs) < 2:
+        for s in secs:
+            s.macro_id, s.macro_label, s.macro_index = s.id, s.label.value, 1
+            s.macro_part, s.macro_parts = 1, 1
+        return
+
+    # A macro section longer than this fraction of the record is not a section.
+    # Pop and hip-hop top out around a fifth; anything past that is a run of
+    # mislabelled segments that merging has papered over, and presenting it as
+    # one confident section is worse than showing the seams.
+    model_named = all(s.label_source == "model" for s in secs)
+    # The trained model often marks internal changes inside a sustained chorus.
+    # Keep them available for inspection without turning each one into a new
+    # top-level chorus. Its consecutive labels warrant a larger merge window.
+    budget = (max(50.0, 0.38 * (analysis.duration or 0.0)) if model_named
+              else max(24.0, 0.22 * (analysis.duration or 0.0)))
+
+    # Run-length encode on the label, breaking a run when it would exceed the
+    # budget. A segment that on its own already exceeds the budget is left as its
+    # own macro rather than merged with anything.
+    runs: list[list] = []
+    for sec in secs:
+        if (runs and sec.label is runs[-1][0].label
+                and sec.label.value not in ("unknown", "")
+                and (sec.end - runs[-1][0].start) <= budget):
+            runs[-1].append(sec)
+        else:
+            runs.append([sec])
+
+    # Number the repeats of each name the way a producer counts them — by the
+    # repeat group, not by position on the timeline.
+    #
+    # Keyed on the group so every occurrence of the same passage gets the same
+    # number. Numbering by position restarted whenever the merge budget split a
+    # run, and one chorus then appeared as "Chorus 1, Chorus 2, Chorus 3" — the
+    # exact confusion the numbering exists to remove.
+    # Per name, not one global counter: a producer counts choruses among
+    # choruses. A global index produced "verse 3, chorus 4, instrumental 5" — a
+    # sequence of positions masquerading as a form.
+    group_index: dict[tuple, int] = {}
+    per_name: dict[str, int] = {}
+    for run in runs:
+        name = run[0].label.value
+        key = (name, run[0].repeat_group)
+        if key not in group_index:
+            per_name[name] = per_name.get(name, 0) + 1
+            group_index[key] = per_name[name]
+
+    distinct_groups: dict[str, set] = {}
+    for run in runs:
+        distinct_groups.setdefault(run[0].label.value, set()).add(run[0].repeat_group)
+
+    model_occurrences: dict[str, int] = {}
+    model_totals: dict[str, int] = {}
+    if model_named:
+        for run in runs:
+            name = run[0].label.value
+            model_totals[name] = model_totals.get(name, 0) + 1
+    for n, run in enumerate(runs, 1):
+        name = run[0].label.value
+        if model_named:
+            model_occurrences[name] = model_occurrences.get(name, 0) + 1
+            idx = model_occurrences[name]
+            total = model_totals[name]
+        else:
+            idx = group_index[(name, run[0].repeat_group)]
+            total = len(distinct_groups.get(name, ()))
+        # "Intro" and "Outro" are not counted — nobody says "Intro 2".
+        numbered = name not in ("intro", "outro", "unknown")
+        for part, sec in enumerate(run, 1):
+            sec.macro_id = f"mac{n:03d}"
+            sec.macro_index = n
+            sec.macro_part = part
+            sec.macro_parts = len(run)
+            sec.macro_label = f"{name} {idx}" if (numbered and total > 1) else name
+
+
+def label_sections_by_group(analysis) -> None:
+    """Name each repeat group once, then propagate the name to its members.
+
+    The unit of naming is the repeat group, not the section.  Two sections that
+    are the same music must get the same name, and the way to guarantee that is
+    to decide the name once per group from the group's measured profile.
+
+    Only evidence is used: level, how many parts play, whether vocals play,
+    how wide the image is, and where the group sits in the song.  Nothing here
+    calls a section a "chorus" because it is quiet, and where the evidence is
+    genuinely thin the result is `unknown` with a low confidence rather than a
+    confident guess.
+    """
+    secs = analysis.sections
+    if not secs:
+        return
+
+    groups: dict[object, list[Section]] = {}
+    for sec in secs:
+        key = sec.repeat_group if sec.repeat_group is not None else sec.id
+        groups.setdefault(key, []).append(sec)
+
+    vocal_families = {"vocals"}
+    profile: dict[object, dict] = {}
+    for key, members in groups.items():
+        e = float(np.mean([m.energy_perceived for m in members]))
+        raw = float(np.mean([m.energy_raw for m in members]))
+        counts = [m.source_count for m in members]
+        has_vocal = any(
+            set(m.source_ids) & vocal_families for m in members
+        ) or any(analysis.family_of(sid) == "vocals" for m in members
+                 for sid in m.source_ids)
+        profile[key] = {
+            "energy": e, "raw": raw,
+            "count": float(np.mean(counts)),
+            "members": members,
+            "has_vocal": has_vocal,
+            "width": float(np.mean([m.stereo_width for m in members])),
+            "first": min(m.start for m in members),
+            "last": max(m.end for m in members),
+        }
+
+    n_sec = len(secs)
+    es = sorted(p["energy"] for p in profile.values())
+    med_e = es[len(es) // 2]
+    hi_e = float(np.percentile(es, 80))
+    lo_e = float(np.percentile(es, 25))
+    counts_all = sorted(p["count"] for p in profile.values())
+    hi_c = counts_all[-1] if counts_all else 0.0
+    lo_c = counts_all[0] if counts_all else 0.0
+
+    _GROUP_ENERGY_CACHE.clear()
+    _GROUP_ENERGY_CACHE.update({k: v["energy"] for k, v in profile.items()})
+
+    first_key = min(profile, key=lambda k: profile[k]["first"])
+    last_key = max(profile, key=lambda k: profile[k]["last"])
+
+    # A chorus is a role in the form, not simply the loudest seven seconds.
+    # Count *separate appearances* of each musical group. Adjacent fragments
+    # of one passage are one appearance; confusing them for repetitions made a
+    # continuous rap verse look like four choruses. Of the vocal groups heard
+    # at least twice, the most recurrent and fullest is the best-supported
+    # chorus candidate. If nothing recurs, we do not force a chorus name.
+    def appearances(members: list[Section]) -> int:
+        ordered = sorted(members, key=lambda s: s.start)
+        count, previous_end = 0, -float("inf")
+        for sec in ordered:
+            if sec.start > previous_end + 0.75:
+                count += 1
+            previous_end = max(previous_end, sec.end)
+        return count
+
+    vocal_keys = [k for k, p in profile.items() if p["has_vocal"]]
+    recurring = [k for k in vocal_keys if appearances(profile[k]["members"]) >= 2]
+    chorus_key = max(recurring, key=lambda k: (
+        appearances(profile[k]["members"]), profile[k]["energy"],
+        profile[k]["count"]), default=None)
+    chorus_tier = {chorus_key} if chorus_key is not None else set()
+
+
+    # The group that opens the record is an intro; the one that closes it is an
+    # outro — unless that is also the chorus group, in which case only the very
+    # last section is renamed (a chorus that fades out is still a chorus).
+    intro_key = first_key if first_key != chorus_key else None
+
+    for key, p in profile.items():
+        members = sorted(p["members"], key=lambda m: m.start)
+        label, conf, alts = _classify_group(
+            analysis, p, key, chorus_tier, intro_key, last_key,
+            med_e, hi_e, lo_e, lo_c, hi_c, n_sec,
+        )
+        for rank, sec in enumerate(members):
+            sec.repeat_rank = rank
+            m_label, m_conf, m_alts = label, conf, alts
+            if label in _POSITION_LABELS and not _occupies_position(
+                    label, sec, analysis.duration):
+                # The group's name came from where it sits, and this occurrence is
+                # not there.
+                #
+                # A group is named for the record's opening or closing passage and
+                # the name was then painted on every member of it. On "DNA." the
+                # group holding 41-57 s and 182-186 s is an outro because the
+                # second one ends the record, so a quiet breakdown two thirds of
+                # the way in was called an outro too. The form read Intro, Chorus,
+                # Chorus, Outro, Chorus, Chorus, Breakdown, Chorus, Chorus,
+                # Outro -- an outro in fourth position, followed by five more
+                # sections, which is the most damaging single claim the app can
+                # make about a song.
+                #
+                # Position is a fact about one passage, not about a group. A member
+                # that is not at that position is classified on its own content,
+                # by the same rules with the position cues removed.
+                m_label, m_conf, m_alts = _classify_group(
+                    analysis, p, key, chorus_tier, intro_key, last_key,
+                    med_e, hi_e, lo_e, lo_c, hi_c, n_sec, use_position=False,
+                )
+            sec.label = m_label
+            sec.label_confidence = m_conf
+            sec.label_source = "heuristic"
+            sec.label_alternatives = m_alts
+
+
+#: Labels that describe a passage by where it sits in the record rather than by
+#: what is in it. These cannot be given to a whole repeat group, only to the
+#: occurrences that actually hold that position.
+_POSITION_LABELS = frozenset({SectionLabel.INTRO, SectionLabel.OUTRO, SectionLabel.FADE})
+
+#: How close to an edge counts as being at that edge, seconds. The same 0.75 the
+#: group classifier uses, so the two agree about which occurrence is the ending.
+_POSITION_EDGE_S = 0.75
+
+
+def _occupies_position(label: SectionLabel, sec, duration: float) -> bool:
+    """Does this section actually sit where `label` claims?"""
+    if label is SectionLabel.INTRO:
+        return sec.start < _POSITION_EDGE_S
+    return sec.end >= duration - _POSITION_EDGE_S
+
+
+def _classify_group(
+    analysis, p, key, chorus_tier, intro_key, last_key,
+    med_e, hi_e, lo_e, lo_c, hi_c, n_sec, use_position: bool = True,
+):
+    is_chorus = key in chorus_tier
+    members = p["members"]
+    first_sec = min(members, key=lambda m: m.start)
+    is_opening = first_sec.start < 0.75
+    is_closing = max(m.end for m in members) >= analysis.duration - 0.75
+
+    candidates: list[tuple[float, SectionLabel]] = []
+
+    def add(label: SectionLabel, score: float) -> None:
+        candidates.append((score, label))
+
+    # --- position-based, but only when the position is actually meaningful ---
+    #
+    # Position constrains the *vocabulary*, not just the score. A repeat group
+    # can contain a genuinely similar passage anywhere in the record, but no
+    # matter how alike it is, material that occurs in the middle of a song is
+    # not an intro. Without this rule a group holding the opening bars and an
+    # unrelated mid-song section forced the whole group to be called "intro",
+    # which is how one section two minutes in ended up mislabelled.
+    early_only = p["last"] <= 0.22 * analysis.duration
+    if use_position:
+        if is_opening and key == intro_key and p["energy"] <= hi_e and early_only:
+            add(SectionLabel.INTRO, 0.55 if p["count"] < hi_c else 0.3)
+        if is_closing and not is_chorus:
+            add(SectionLabel.OUTRO, 0.5)
+            add(SectionLabel.FADE, 0.25)
+        if is_closing and is_chorus:
+            # a chorus that fades: keep the group name, flag the final section
+            add(SectionLabel.OUTRO, 0.3)
+        if is_opening and key == intro_key and not early_only:
+            # mid-record member present: it is a verse-like passage, not an intro
+            add(SectionLabel.VERSE, 0.3)
+
+    if is_chorus:
+        conf_base = 0.5
+        conf_base += 0.2 if p["count"] >= hi_c else 0.0
+        conf_base += 0.2 if p["energy"] >= hi_e else 0.0
+        add(SectionLabel.CHORUS, conf_base)
+        if p["width"] > 0.4:
+            add(SectionLabel.PRE_CHORUS, 0.35)
+    else:
+        if p["has_vocal"]:
+            # A section with a vocal is a verse unless it is markedly quieter
+            # than the record. Calling a four-part vocal section a "breakdown"
+            # because it sat at the 25th percentile of five groups was wrong,
+            # and percentiles on a handful of groups are not stable enough to
+            # carry that decision.
+            quiet = p["energy"] < 0.86 * med_e
+            if quiet and p["count"] <= lo_c + 0.5:
+                add(SectionLabel.BREAKDOWN, 0.42)
+                add(SectionLabel.VERSE, 0.3)
+            else:
+                add(SectionLabel.VERSE, 0.5)
+                if p["energy"] >= med_e:
+                    add(SectionLabel.CHORUS, 0.32)
+                if quiet:
+                    add(SectionLabel.INTERLUDE, 0.26)
+        else:
+            if p["count"] <= lo_c + 0.5 and p["energy"] < 0.86 * med_e:
+                add(SectionLabel.BREAKDOWN, 0.45)
+            elif p["energy"] >= hi_e and p["count"] >= hi_c:
+                add(SectionLabel.INSTRUMENTAL, 0.4)
+                add(SectionLabel.SOLO, 0.3)
+            else:
+                add(SectionLabel.INSTRUMENTAL, 0.34)
+                if p["energy"] <= lo_e:
+                    add(SectionLabel.INTERLUDE, 0.3)
+
+    if not candidates:
+        return SectionLabel.UNKNOWN, 0.0, []
+
+    best_score, best_label = max(candidates, key=lambda c: c[0])
+    if best_label is SectionLabel.UNKNOWN:
+        return SectionLabel.UNKNOWN, 0.0, []
+
+    # How distinctive is this group? A group that matches almost every other
+    # group tells us little; a group that stands apart tells us a lot.
+    others = [k for k in list(chorus_tier) + ([intro_key] if intro_key else [])
+              if k is not None and k != key]
+    distinct = 0.0
+    if others:
+        distinct = abs(p["energy"] - float(np.mean([profile_energy(x) for x in others])))
+        distinct = min(1.0, distinct / 0.25)
+    conf = float(np.clip(best_score * (0.75 + 0.35 * distinct), 0.08, 0.88))
+
+    alts = sorted(
+        (LabelAlternative(label=lab.value, score=round(float(s), 3))
+         for s, lab in candidates if lab is not best_label),
+        key=lambda x: -x.score,
+    )[:3]
+    return best_label, conf, alts
+
+
+def profile_energy(key) -> float:
+    """Energy of a group key, for the distinctiveness calculation."""
+    sec = _GROUP_ENERGY_CACHE.get(key)
+    return sec if sec is not None else 0.0
+
+
+_GROUP_ENERGY_CACHE: dict[object, float] = {}
+
+
+def _section_delta(prev, cur) -> list[str]:
+    if prev is None:
+        return []
+    out: list[str] = []
+    added = set(cur.source_ids) - set(prev.source_ids)
+    removed = set(prev.source_ids) - set(cur.source_ids)
+    if added:
+        names = [analysis_label(analysis_source(sid)) for sid in sorted(added)]
+        out.append("adds " + ", ".join(names))
+    if removed:
+        names = [analysis_label(analysis_source(sid)) for sid in sorted(removed)]
+        out.append("drops " + ", ".join(names))
+    # These are changes in song-relative 0-1 scores. A 0.47 difference is 47
+    # points on that scale, not a 47% change in physical energy or stereo width.
+    de = cur.energy_perceived - prev.energy_perceived
+    if abs(de) > 0.08:
+        out.append(f"energy {'rises' if de > 0 else 'falls'} {abs(de) * 100:.0f} points on this song's scale")
+    dw = cur.stereo_width - prev.stereo_width
+    if abs(dw) > 0.05:
+        out.append(f"image {'widens' if dw > 0 else 'narrows'} {abs(dw) * 100:.0f} points on the width scale")
+    return out
+
+
+def analysis_source(sid: str):
+    from arrangement.schema import Source
+
+    return Source(id=sid, label=layer_meta(sid)["label"])
+
+
+def analysis_label(src) -> str:
+    return src.label
+
+
+def _build_transitions(analysis, st) -> None:
+    for i, sec in enumerate(analysis.sections):
+        if i == 0:
+            continue
+        prev = analysis.sections[i - 1]
+        t = sec.start
+        evs = [e for e in analysis.events if abs(e.t - t) < 0.6]
+        kind = "cut"
+        if prev.end < t - 0.35:
+            kind = "gap"
+        elif any(e.kind == EventKind.ENTER for e in evs):
+            kind = "build"
+        elif any(e.kind == EventKind.SILENCE for e in evs):
+            kind = "drop"
+        strength = float(np.clip(len(evs) / 3.0, 0.1, 1.0))
+        analysis.transitions.append(SectionTransition(
+            t=t, from_section=prev.id, to_section=sec.id, kind=kind,
+            strength=strength, novelty=sec.novelty,
+            gap_seconds=max(0.0, t - prev.end),
+            evidence=[e.evidence[0] for e in evs[:2] if e.evidence],
+        ))
+
+
+def _build_curves(analysis, feats, energy, rr, spatial) -> None:
+    cs = CurveSet(frame_hz=feats.frame_hz, duration=analysis.duration)
+    for name, arr, unit, desc in [
+        ("rms_db", feats.rms_db, "dBFS", "master level"),
+        ("spectral_centroid_hz", feats.centroid, "Hz", "brightness"),
+        ("spectral_flatness", feats.flatness, "0-1", "tonal vs noisy"),
+        ("spectral_flux", feats.flux, "norm", "transient activity"),
+        ("harmonic_ratio", 1.0 - feats.hp_ratio, "0-1", "sustained vs percussive"),
+        ("zero_crossing", feats.zcr, "0-1", "high-frequency content"),
+        ("spectral_tilt", feats.spectral_tilt, "dB/oct", "spectral balance"),
+    ]:
+        cs.curves[name] = Curve(name=name, frame_hz=feats.frame_hz,
+                                values=[round(float(v), 4) for v in arr],
+                                unit=unit, description=desc)
+    for i, b in enumerate(feats.band_names):
+        cs.band_energy[b] = Curve(name=b, frame_hz=feats.frame_hz,
+                                  values=[round(float(v), 2) for v in feats.band_db[:, i]],
+                                  unit="dB", description=f"{b} band energy")
+    cs.curves["loudness_approx_lufs"] = Curve(
+        name="loudness_approx_lufs", frame_hz=20.0,
+        values=[round(float(v), 2) for v in np.asarray(
+            analysis.loudness.lra_curve)[: int(analysis.duration * 20) + 1]]
+        if analysis.loudness.lra_curve else [],
+        unit="LUFS", description="short-term K-weighted loudness (approximate)")
+    if spatial.frames:
+        cs.curves["stereo_width"] = Curve(
+            name="stereo_width", frame_hz=spatial.frame_hz,
+            values=[round(f.width, 4) for f in spatial.frames], unit="0-1",
+            description="side/mid energy ratio")
+        cs.curves["stereo_pan"] = Curve(
+            name="stereo_pan", frame_hz=spatial.frame_hz,
+            values=[round(f.pan, 4) for f in spatial.frames], unit="-1..1",
+            description="left/right energy balance")
+        cs.curves["stereo_correlation"] = Curve(
+            name="stereo_correlation", frame_hz=spatial.frame_hz,
+            values=[round(f.correlation, 4) for f in spatial.frames], unit="-1..1",
+            description="inter-channel correlation")
+
+    # Onset rate, in onsets per second, on the same grid as the other curves.
+    #
+    # The energy model's `onset_density` component is a *normalised deviation*:
+    # signed, and clipped once a passage gets busy. That is the right input to
+    # the perceived-energy sum, which only cares which way it moved, and the
+    # wrong thing to draw. Rendered as a row it either saturates into a solid
+    # block or collapses to nothing once the display rescales it, and in neither
+    # case does the height mean anything a producer can read. Zero here really
+    # means no onsets, and the scale is onsets per second.
+    if rr.onsets is not None and len(rr.onsets) and analysis.duration > 0:
+        hz = float(feats.frame_hz)
+        n = max(2, int(analysis.duration * hz) + 1)
+        win_s = 0.5
+        # Count onsets in each half-second window with two binary searches.
+        #
+        # The obvious alternative — prefix sums over the sorted onset times and
+        # differencing them — returns a *time*, not a count, because the
+        # cumulative array holds times. It is also inverted: more onsets means
+        # less time between the surrounding edges, so a busier passage scored
+        # lower. Two searchsorted calls are exact and O(n log m).
+        on = np.sort(np.asarray(rr.onsets, dtype=np.float64))
+        starts = np.arange(n) / hz
+        i0 = np.searchsorted(on, starts, side="right")
+        i1 = np.searchsorted(on, starts + win_s, side="right")
+        rate = (i1 - i0) / win_s
+        cs.curves["onset_rate"] = Curve(
+            name="onset_rate", frame_hz=hz,
+            values=[round(float(v), 3) for v in rate], unit="onsets/s",
+            description=f"onset rate over a {win_s:g}s sliding window")
+
+    analysis.curves = cs
+
+
+def _compute_fingerprint(analysis) -> None:
+    """A compact, comparable summary of the arrangement.
+
+    Useful for "which sections of this record are unusual" and for spotting a
+    chorus that is thinner than the one before it without reading every lane.
+    """
+    fp: dict[str, Any] = {"duration": round(analysis.duration, 1)}
+    if analysis.energy.perceived:
+        fp["energy_mean"] = round(float(np.mean(analysis.energy.perceived.values)), 3)
+        fp["energy_p90"] = round(float(np.percentile(analysis.energy.perceived.values, 90)), 3)
+        fp["energy_dynamic_range"] = round(
+            float(np.percentile(analysis.energy.perceived.values, 95)
+                  - np.percentile(analysis.energy.perceived.values, 10)), 3)
+    if analysis.sources:
+        fp["source_count"] = len(analysis.sources)
+        fp["families"] = sorted({s.family.value for s in analysis.sources})
+        fp["max_concurrent_layers"] = int(max(
+            (s.source_count for s in analysis.sections), default=0))
+    fp["section_count"] = len(analysis.sections)
+    fp["event_count"] = len(analysis.events)
+    fp["bpm"] = round(analysis.beats.bpm, 2)
+    analysis.fingerprint = fp
