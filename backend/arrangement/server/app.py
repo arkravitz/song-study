@@ -508,3 +508,413 @@ def cancel(job_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/jobs/{job_id}/stream")
+def job_stream(job_id: str, request: Request) -> StreamingResponse:
+    """Server-sent progress.
+
+    Polling every 500 ms would work, but SSE means the UI shows a live stage
+    list for a 3-minute separation without hammering the server.
+    """
+    async def gen():
+        last = None
+        while True:
+            if await request.is_disconnected():
+                break
+            j = JOBS.get(job_id)
+            if j is None:
+                yield "event: error\ndata: {\"message\":\"no such job\"}\n\n"
+                break
+            payload = j.as_dict()
+            blob = json.dumps(payload)
+            if blob != last:
+                last = blob
+                yield f"data: {blob}\n\n"
+            if payload["status"] in ("done", "failed", "cancelled"):
+                yield f"event: end\ndata: {blob}\n\n"
+                break
+            time.sleep(0.4)
+
+    return StreamingResponse(gen(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive",
+    })
+
+
+# ---------------------------------------------------------------------------
+# reasoning
+# ---------------------------------------------------------------------------
+
+
+def _client():
+    c = client_from_settings()
+    if not c.enabled:
+        raise HTTPException(503, "DEEPSEEK_API_KEY is not set; reasoning is disabled")
+    return c
+
+
+def _analysis(song_id: str) -> SongAnalysis:
+    try:
+        return load_analysis(song_id)
+    except SongNotFound:
+        raise HTTPException(404, "song not found")
+
+
+def _persist(a: SongAnalysis) -> None:
+    save_analysis(a)
+
+
+class SectionEditState(BaseModel):
+    sections: list[Section]
+    transitions: list[SectionTransition]
+    warnings: list[str]
+
+
+def _section_state(a: SongAnalysis) -> dict[str, Any]:
+    state = SectionEditState(sections=a.sections, transitions=a.transitions,
+                             warnings=a.warnings).model_dump(mode="json")
+    revision = hashlib.sha256(json.dumps(state, sort_keys=True).encode()).hexdigest()
+    return {**state, "revision": revision}
+
+
+@app.get("/api/songs/{song_id}/sections/state")
+def section_state_endpoint(song_id: str) -> dict[str, Any]:
+    return _section_state(_analysis(song_id))
+
+
+class RestoreSectionRequest(BaseModel):
+    state: SectionEditState
+    expected_revision: str
+
+
+@app.put("/api/songs/{song_id}/sections/state")
+def restore_section_state_endpoint(song_id: str, req: RestoreSectionRequest) -> dict[str, Any]:
+    a = _analysis(song_id)
+    if _section_state(a)["revision"] != req.expected_revision:
+        raise HTTPException(409, "Sections changed since this edit. Undo would overwrite those changes.")
+    sections = req.state.sections
+    if not sections or len({s.id for s in sections}) != len(sections) or any(
+        s.start < 0 or s.end > a.duration + .05 or s.end <= s.start
+        for s in sections
+    ) or any(abs(left.end - right.start) > .05 for left, right in zip(sections, sections[1:])):
+        raise HTTPException(400, "The saved section layout is invalid.")
+    # Restore edit metadata exactly; audio, curves and other analysis stay intact.
+    a.sections = sections
+    a.transitions = req.state.transitions
+    a.warnings = req.state.warnings
+    _persist(a)
+    return _section_state(a)
+
+
+class WindowRequest(BaseModel):
+    t0: float
+    t1: float
+    deep: bool = False
+
+
+class SplitSectionRequest(BaseModel):
+    macro_id: str
+    at: float = Field(allow_inf_nan=False)
+    before_name: str | None = Field(default=None, min_length=1, max_length=36)
+    after_name: str | None = Field(default=None, min_length=1, max_length=36)
+
+
+@app.post("/api/songs/{song_id}/sections/split")
+def split_section_endpoint(song_id: str, req: SplitSectionRequest) -> dict[str, Any]:
+    """Apply a listener's structural correction to the saved song analysis."""
+    a = _analysis(song_id)
+    try:
+        section = split_macro_section(a, req.macro_id, req.at,
+                                      req.before_name, req.after_name)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    _persist(a)
+    return {"section_id": section.id, "at": req.at,
+            "macro_sections": len({s.macro_id or s.id for s in a.sections})}
+
+
+class MoveSectionBoundaryRequest(BaseModel):
+    right_macro_id: str
+    at: float = Field(allow_inf_nan=False)
+
+
+@app.post("/api/songs/{song_id}/sections/boundary")
+def move_section_boundary_endpoint(song_id: str, req: MoveSectionBoundaryRequest) -> dict[str, Any]:
+    a = _analysis(song_id)
+    try:
+        move_macro_boundary(a, req.right_macro_id, req.at)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    _persist(a)
+    return {"at": req.at}
+
+
+class MergeSectionsRequest(BaseModel):
+    right_macro_id: str
+
+
+@app.post("/api/songs/{song_id}/sections/merge")
+def merge_sections_endpoint(song_id: str, req: MergeSectionsRequest) -> dict[str, Any]:
+    a = _analysis(song_id)
+    try:
+        macro_id = merge_macro_sections(a, req.right_macro_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    _persist(a)
+    return {"macro_id": macro_id}
+
+
+class CompareRequest(BaseModel):
+    a0: float
+    a1: float
+    b0: float
+    b1: float
+    label_a: str = ""
+    label_b: str = ""
+    deep: bool = False
+
+
+class QuestionRequest(BaseModel):
+    question: str
+    deep: bool = False
+
+
+class EventRequest(BaseModel):
+    event_id: str
+    deep: bool = False
+
+
+class EnergyRequest(BaseModel):
+    index: int
+    deep: bool = False
+
+
+def _guard(fn):
+    """Convert LLMError into a 502.
+
+    Two things matter here. ``functools.wraps`` preserves the signature, without
+    which FastAPI inspects ``(*args, **kwargs)`` and starts demanding the
+    endpoint's own parameters as query strings. And the wrapper stays *synchronous*,
+    so FastAPI runs it in a threadpool — the DeepSeek call blocks for 20-30 s and
+    must not occupy the event loop.
+    """
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except LLMError as exc:
+            raise HTTPException(502, f"DeepSeek error: {exc}")
+
+    return wrapper
+
+
+@app.post("/api/songs/{song_id}/sections/label")
+@_guard
+def label_sections_endpoint(song_id: str, deep: bool = False) -> dict[str, Any]:
+    """Name the sections.
+
+    Naming is a judgement, so it goes through the model — but the input is
+    entirely measured and the output is restricted to a fixed vocabulary, with
+    the constraints (a group is named once, an intro cannot occur mid-record)
+    enforced in code rather than left to the prompt.
+    """
+    a = _analysis(song_id)
+    ins = interpret.label_sections(a, _client(), deep=deep)
+    a.insights = [i for i in a.insights if i.scope != "sections"] + [ins]
+    _persist(a)
+    return {
+        "insight": ins.model_dump(mode="json"),
+        "grounding": summarise_grounding(ins.claims),
+        "sections": [
+            {"id": s.id, "start": s.start, "end": s.end, "label": s.label.value,
+             "confidence": round(s.label_confidence, 3), "source": s.label_source,
+             "repeat_group": s.repeat_group, "repeat_rank": s.repeat_rank,
+             "description": s.description}
+            for s in a.sections
+        ],
+    }
+
+
+@app.post("/api/songs/{song_id}/insight")
+@_guard
+def insight(song_id: str, deep: bool = False) -> dict[str, Any]:
+    a = _analysis(song_id)
+    ins = interpret.analyse_song(a, _client(), deep=deep)
+    a.insights = [i for i in a.insights if i.scope != "song"] + [ins]
+    _persist(a)
+    return {"insight": ins.model_dump(mode="json"),
+            "grounding": summarise_grounding(ins.claims)}
+
+
+@app.post("/api/songs/{song_id}/insight/window")
+@_guard
+def insight_window(song_id: str, req: WindowRequest) -> dict[str, Any]:
+    a = _analysis(song_id)
+    ins = interpret.explain_window(a, _client(), req.t0, req.t1, deep=req.deep)
+    a.insights = [i for i in a.insights
+                  if not i.scope.startswith(f"window:{req.t0:.2f}")] + [ins]
+    _persist(a)
+    return {"insight": ins.model_dump(mode="json"),
+            "grounding": summarise_grounding(ins.claims)}
+
+
+@app.post("/api/songs/{song_id}/insight/event")
+@_guard
+def insight_event(song_id: str, req: EventRequest) -> dict[str, Any]:
+    a = _analysis(song_id)
+    ins = interpret.explain_event(a, _client(), req.event_id, deep=req.deep)
+    a.insights = [i for i in a.insights if i.scope != f"event:{req.event_id}"] + [ins]
+    _persist(a)
+    return {"insight": ins.model_dump(mode="json"),
+            "grounding": summarise_grounding(ins.claims)}
+
+
+@app.post("/api/songs/{song_id}/insight/energy")
+@_guard
+def insight_energy(song_id: str, req: EnergyRequest) -> dict[str, Any]:
+    a = _analysis(song_id)
+    ins = interpret.explain_energy_change(a, _client(), req.index, deep=req.deep)
+    a.insights = [i for i in a.insights if i.scope != f"energy:{req.index}"] + [ins]
+    _persist(a)
+    return {"insight": ins.model_dump(mode="json"),
+            "grounding": summarise_grounding(ins.claims)}
+
+
+@app.post("/api/songs/{song_id}/compare")
+@_guard
+def compare_windows(song_id: str, req: CompareRequest) -> dict[str, Any]:
+    a = _analysis(song_id)
+    ins = interpret.compare(a, _client(), req.a0, req.a1, req.b0, req.b1,
+                            req.label_a, req.label_b, deep=req.deep)
+    a.comparisons = [c for c in a.comparisons
+                     if not (c.a_ref == ins.a_ref and c.b_ref == ins.b_ref)] + [ins]
+    _persist(a)
+    return {"comparison": ins.model_dump(mode="json"),
+            "grounding": summarise_grounding(ins.claims)}
+
+
+@app.post("/api/songs/{song_id}/ask")
+@_guard
+def ask(song_id: str, req: QuestionRequest) -> dict[str, Any]:
+    a = _analysis(song_id)
+    q = req.question.strip()
+    if not q:
+        raise HTTPException(400, "empty question")
+    ins = interpret.answer_question(a, _client(), q, deep=req.deep)
+    a.insights = [i for i in a.insights if i.scope != "question"] + [ins]
+    _persist(a)
+    return {"insight": ins.model_dump(mode="json"),
+            "grounding": summarise_grounding(ins.claims)}
+
+
+@app.post("/api/songs/{song_id}/lessons")
+@_guard
+def lessons(song_id: str, deep: bool = True) -> dict[str, Any]:
+    a = _analysis(song_id)
+    ins = interpret.lessons(a, _client(), deep=deep)
+    a.insights = [i for i in a.insights if i.scope != "lessons"] + [ins]
+    _persist(a)
+    return {"insight": ins.model_dump(mode="json"),
+            "grounding": summarise_grounding(ins.claims)}
+
+
+# ---------------------------------------------------------------------------
+# library scan
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/library")
+def library(root: str | None = None, limit: int = 200,
+            max_dirs: int = 20000) -> dict[str, Any]:
+    """List audio files under a folder so they can be queued without uploading.
+
+    Bounded on purpose. The obvious implementation — ``sorted(base.rglob("*"))`` —
+    materialises the entire recursive listing and sorts it before filtering, so
+    pointing this at a home directory walks every ``node_modules`` and
+    ``.git`` object on the machine. It did not fail; it simply never returned,
+    which read as a dead button.
+
+    So: walk with pruning, cap the directories visited, never build a list of
+    everything, and say so in the response when the result was cut short. A
+    silent cap is how a scan appears to work while quietly hiding half a library.
+    """
+    base = Path(root).expanduser() if root else Path.home()
+    if not base.exists():
+        raise HTTPException(404, f"no such folder: {base}")
+    if not base.is_dir():
+        raise HTTPException(400, f"not a folder: {base}")
+
+    exts = {".flac", ".mp3", ".m4a", ".wav", ".aac", ".ogg", ".opus", ".aiff", ".aif"}
+    # Directories that cannot contain a music library worth scanning. Skipping
+    # them is the difference between milliseconds and minutes.
+    skip = {
+        "node_modules", ".git", ".svn", ".hg", "__pycache__", ".venv", "venv",
+        "Library", ".Trash", ".cache", ".npm", ".cargo", ".rustup", "vendor",
+        ".next", ".nuxt", "dist", "build", ".gradle", ".m2", "site-packages",
+        ".venv-uvr", "Pods", "DerivedData", ".DS_Store", ".tox", ".mypy_cache",
+        ".pytest_cache", ".ruff_cache", "env", "virtualenv",
+    }
+
+    out: list[dict[str, Any]] = []
+    seen_dirs = 0
+    hit_limit = False
+    hit_dir_cap = False
+
+    for dirpath, dirnames, filenames in os.walk(base, topdown=True, followlinks=False):
+        seen_dirs += 1
+        if seen_dirs > max_dirs:
+            hit_dir_cap = True
+            break
+        # Prune in place, which is what makes os.walk skip the subtree.
+        dirnames[:] = sorted(
+            d for d in dirnames
+            if d not in skip and not d.startswith(".")
+        )
+        for fn in sorted(filenames):
+            ext = Path(fn).suffix.lower()
+            if ext not in exts or fn.startswith("."):
+                continue
+            p = Path(dirpath) / fn
+            try:
+                size = p.stat().st_size
+            except OSError:
+                continue
+            out.append({"path": str(p), "name": fn, "size": size,
+                        "rel": str(p.relative_to(base))})
+            if len(out) >= limit:
+                hit_limit = True
+                break
+        if hit_limit:
+            break
+
+    out.sort(key=lambda d: d["rel"].lower())
+    return {
+        "root": str(base),
+        "files": out,
+        "count": len(out),
+        "truncated": hit_limit or hit_dir_cap,
+        "scanned_dirs": seen_dirs,
+        # A specific next step beats a bare "truncated": tell the user what to do.
+        "note": (
+            f"stopped after {limit} files — narrow the folder to see the rest"
+            if hit_limit else
+            f"stopped after {max_dirs} folders — narrow the folder to see the rest"
+            if hit_dir_cap else None
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# static
+# ---------------------------------------------------------------------------
+
+
+@app.get("/")
+def index() -> Any:
+    if (STATIC_DIR / "index.html").exists():
+        return FileResponse(str(STATIC_DIR / "index.html"))
+    return JSONResponse({
+        "message": "Arrangement Analyzer API is running. The frontend is not built; "
+                   "run `cd frontend && npm install && npm run build`, or use the "
+                   "Vite dev server with `npm run dev`.",
+        "api": "/api/health",
+    })
