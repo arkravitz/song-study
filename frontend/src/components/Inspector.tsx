@@ -453,3 +453,352 @@ function pulseRange(
   return `steady at ${num(bpm, 1)} BPM`
 }
 
+export function SongOverview({
+  song, selectedSectionId, onPickSection,
+}: {
+  song: SongSummary
+  selectedSectionId?: string | null
+  onPickSection?: (s: Section) => void
+}) {
+  const [tab, setTab] = useState<'song' | 'instruments' | 'measurements'>('song')
+  const fam = new Map<string, Source[]>()
+  for (const s of song.sources) {
+    const arr = fam.get(s.family) ?? []
+    arr.push(s)
+    fam.set(s.family, arr)
+  }
+  return (
+    <div className="card">
+      <div className="seg-ctl" style={{ marginBottom: 10 }}>
+        {([
+          ['song', 'the song'],
+          ['instruments', 'instruments'],
+          ['measurements', 'measurements'],
+        ] as const).map(([k, label]) => (
+          <button key={k} className={tab === k ? 'on' : ''} onClick={() => setTab(k)}>{label}</button>
+        ))}
+      </div>
+
+      {tab === 'song' && (
+        <SongShape
+          song={song}
+          selectedSectionId={selectedSectionId}
+          onPickSection={onPickSection}
+        />
+      )}
+
+      {tab === 'measurements' && (
+        <>
+          <h4>Track</h4>
+          <dl className="kv">
+            <dt>duration</dt><dd>{fmtTime(song.duration)}</dd>
+            <dt>source</dt><dd>{String(song.source_quality?.container ?? '?')}/{String(song.source_quality?.codec ?? '?')}</dd>
+            <dt>native rate</dt><dd>{String(song.source_quality?.native_sample_rate ?? '?')} Hz</dd>
+            <dt>bit depth</dt><dd>{String(song.source_quality?.bits_per_sample ?? '?')}</dd>
+            <dt>lossy</dt><dd>{song.source_quality?.lossy ? 'yes' : 'no'}</dd>
+          </dl>
+          <h4>Tempo &amp; metre</h4>
+          <dl className="kv">
+            <dt>tempo</dt><dd>{num(song.grid.bpm, 2)} BPM</dd>
+            <dt>confidence</dt><dd>{pct(song.grid.bpm_confidence)}</dd>
+            <dt>metre</dt><dd>{song.grid.meter} ({pct(song.grid.meter_confidence)})</dd>
+            <dt>first downbeat</dt><dd>{fmtTime(song.grid.offset)}</dd>
+            <dt>tempo drift</dt><dd>{num(song.grid.tempo_drift, 1)} BPM</dd>
+            <dt>beats found</dt><dd>{song.beats.onset_times.length ? song.grid.beats.length : 0}</dd>
+          </dl>
+          {song.grid.is_tangent && (
+            <div className="warn-box" style={{ marginTop: 6 }}>
+              Irregular pulse detected — bar numbers are approximate. Bar-referenced
+              claims from the reasoning model should be read with that in mind.
+            </div>
+          )}
+          <h4>Loudness</h4>
+          <dl className="kv">
+            <dt>integrated</dt><dd>{fmtDb(song.loudness.integrated_lufs)} LUFS</dd>
+            <dt>range (LRA)</dt><dd>{fmtDb(song.loudness.lra)} LU</dd>
+            <dt>true peak</dt><dd>{fmtDb(song.loudness.true_peak_dbfs)}</dd>
+            <dt>crest</dt><dd>{fmtDb(song.loudness.crest_db)}</dd>
+            <dt>method</dt><dd style={{ fontSize: 10 }}>{song.loudness.method}</dd>
+          </dl>
+          <h4>Stereo image</h4>
+          {song.spatial_summary.is_mono ? (
+            <div className="warn-box">
+              This file is mono. Spatial values are undefined rather than measured on
+              duplicated channels.
+            </div>
+          ) : (
+            <dl className="kv">
+              <dt>mean pan</dt><dd>{panLabel(song.spatial_summary.mean_pan ?? 0)}</dd>
+              {/* The bands, not just the broadband mean.
+
+                  This panel said "width (side/mid) 0.051" while the timeline's
+                  stereo-width row drew three bands reading 0.047 / 0.137 /
+                  0.109 on the same track. Two numbers for one idea, no
+                  explanation, and the mid band nearly three times the headline —
+                  so a reader comparing them concludes one of them is broken.
+
+                  The broadband mean is still here and still labelled as a mean,
+                  because it is a real number; the bands come first because they
+                  are what the timeline shows and what the "high band is wider
+                  than the low" caveat above is talking about. Reporting the same
+                  thing twice with the same words is the only way they can be
+                  compared. */}
+              {song.spatial_summary.bands.map((b) => (
+                <span key={b.key} style={{ display: 'contents' }}>
+                  <dt>width, {b.label} ({fmtHz(b.lo_hz)}-{fmtHz(b.hi_hz)})</dt>
+                  <dd>{num(song.spatial_summary[b.key] ?? 0, 3)}</dd>
+                </span>
+              ))}
+              <dt>width, whole spectrum</dt>
+              <dd>{num(song.spatial_summary.mean_width ?? 0, 3)}</dd>
+              <dt>correlation</dt><dd>{num(song.spatial_summary.mean_correlation ?? 0, 3)}</dd>
+            </dl>
+          )}
+        </>
+      )}
+
+      {tab === 'instruments' && (
+        <>
+          {[...fam.entries()].map(([f, srcs]) => (
+            <div key={f} style={{ marginBottom: 10 }}>
+              <h4>{FAMILY_LABEL[f] ?? titleCase(f)}</h4>
+              {srcs.map((s) => (
+                <SourceRow key={s.id} s={s} song={song} />
+              ))}
+            </div>
+          ))}
+        </>
+      )}
+
+      {tab === 'measurements' && (
+        <>
+          <h4>Models used</h4>
+          <dl className="kv">
+            {Object.entries(song.models_used).map(([k, v]) => (
+              <span key={k} style={{ display: 'contents' }}>
+                <dt>{k}</dt><dd style={{ fontSize: 10 }}>{v}</dd>
+              </span>
+            ))}
+          </dl>
+          <h4>Energy model</h4>
+          <div className="tiny faint" style={{ lineHeight: 1.5 }}>{song.energy.model_notes}</div>
+          <div className="tiny faint" style={{ margin: '8px 0' }}>
+            This is a score relative to this song, not a measure of loudness or a percentage of physical energy.
+          </div>
+          <dl className="kv">
+            {Object.entries(song.energy.weights)
+              .sort((a, b) => b[1] - a[1])
+              .map(([name, weight]) => {
+                const total = Object.values(song.energy.weights).reduce((sum, value) => sum + value, 0)
+                const label: Record<string, string> = {
+                  loudness: 'Loudness', active_layers: 'Active parts',
+                  onset_density: 'Rhythmic activity', bass_activity: 'Low-end activity',
+                  high_activity: 'High-frequency activity', percussive_energy: 'Attacks and transients',
+                  hp_ratio: 'Percussive balance', band_spread: 'Frequency coverage',
+                  stereo_width: 'Stereo width',
+                }
+                return <span key={name} style={{ display: 'contents' }}>
+                  <dt title={song.energy.components[name]?.description ?? ''}>{label[name] ?? componentLabel(name)}</dt>
+                  <dd>{Math.round(weight / Math.max(total, 1e-9) * 100)}%</dd>
+                </span>
+              })}
+          </dl>
+          <div className="tiny faint">Loudness, spectrum, transients and width come from the recording. “Active parts” comes from separated stems and can be less reliable.</div>
+          <h4>Fingerprint</h4>
+          <dl className="kv">
+            {Object.entries(song.fingerprint).map(([k, v]) => (
+              <span key={k} style={{ display: 'contents' }}>
+                <dt>{k}</dt>
+                <dd style={{ fontSize: 10 }}>{typeof v === 'object' ? JSON.stringify(v) : String(v)}</dd>
+              </span>
+            ))}
+          </dl>
+          <h4>Pipeline</h4>
+          {song.stages.map((st) => (
+            <div className="stage-row" key={st.name}>
+              <span className="sdot" />
+              <span className="sname">{st.name}</span>
+              <span className="sstat">
+                {st.status}{st.duration ? ` ${num(st.duration, 1)}s` : ''}
+              </span>
+            </div>
+          ))}
+        </>
+      )}
+    </div>
+  )
+}
+
+function SourceRow({ s, song }: { s: Source; song: SongSummary }) {
+  const [open, setOpen] = useState(false)
+  return (
+    <div>
+      <div className="src-item" onClick={() => setOpen(!open)}>
+        <span className="swatch" style={{ background: s.color }} />
+        <span className="lbl">{s.label}</span>
+        <span className="cnt">{s.segments.length} spans</span>
+        <span className="cnt">{fmtDb(s.mean_level_db, 0)}</span>
+      </div>
+      {open && (
+        <div style={{ padding: '2px 0 8px 18px' }}>
+          <div className="tiny dim">
+            {s.detection_method} · activity contrast score {num(s.confidence, 2)} (not an identification probability)
+          </div>
+          <dl className="kv tiny" style={{ marginTop: 4 }}>
+            <dt>descriptor</dt><dd>{s.descriptor.role ?? '—'}</dd>
+            <dt>timbre</dt><dd>{s.descriptor.descriptors.join(', ') || '—'}</dd>
+            <dt>centroid</dt><dd>{fmtHz(s.descriptor.spectral_centroid_hz)} Hz</dd>
+            <dt>flatness</dt><dd>{num(s.descriptor.spectral_flatness, 3)}</dd>
+            <dt>pan</dt><dd>{panLabel(s.mean_pan)}</dd>
+            <dt>width</dt><dd>{num(s.mean_width, 2)}</dd>
+            <dt>duty cycle</dt><dd>{pct(s.duty_cycle)}</dd>
+            <dt>entries / exits</dt><dd>{s.n_entries} / {s.n_exits}</dd>
+          </dl>
+          <div className="tiny faint" style={{ marginTop: 4 }}>
+            First appearance: {s.segments[0] ? fmtTime(s.segments[0].start) : '—'}
+            {s.segments[0] && song.grid.bpm > 0 && (
+              <> ({fmtBar(s.segments[0].start, song.grid.bpm, song.grid.meter, song.grid.offset)})</>
+            )}
+          </div>
+          <table className="tbl tiny" style={{ marginTop: 4 }}>
+            <thead><tr><th>#</th><th>start</th><th>end</th><th>dur</th><th>level</th></tr></thead>
+            <tbody>
+              {s.segments.slice(0, 12).map((g, i) => (
+                <tr key={i}>
+                  <td>{i + 1}</td>
+                  <td className="num mono">{fmtTime(g.start)}</td>
+                  <td className="num mono">{fmtTime(g.end)}</td>
+                  <td className="num mono">{num(g.end - g.start, 1)}s</td>
+                  <td className="num mono">{num(g.level_db, 0)} dB</td>
+                </tr>
+              ))}
+              {s.segments.length > 12 && (
+                <tr><td colSpan={5} className="faint">+{s.segments.length - 12} more</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+
+
+export function PatternsList({
+  patterns, onJump, selected, onSelect,
+}: {
+  patterns: PatternFinding[]
+  onJump: (t: number) => void
+  selected: string | null
+  onSelect: (id: string | null) => void
+}) {
+  if (!patterns.length) {
+    return <div className="faint small">No structural patterns were detected.</div>
+  }
+
+  /*
+    Two things were wrong with this list, both visible on "DNA.".
+
+    **The internal kind was printed on every card.** `change_grid`,
+    `width_energy`, `repeat_delta` — the schema's names, next to titles that were
+    already in plain English. The instruction this product is built on is not to
+    expose those; they are what the detection is called, not what was found. The
+    tag is gone and nothing replaces it, because the title and the detail already
+    say everything the kind was saying.
+
+    **One finding was printed four times.** Every repeat of a passage produced its
+    own "Later repeat at 27s / 57s / 84s / 173s differs from its first pass" card,
+    all four at strength 0.3, with deltas of -0.11, -0.13, -0.11 and +0.08. Four
+    cards of near-noise reads as four findings and buries the two on the list that
+    are actually about the record. Repeat deltas are now one card: what the
+    repeats do, how many there are, the range, and every timestamp as a chip. The
+    information is identical; the impression is not.
+  */
+  const repeatDeltas = patterns.filter((p) => p.kind === 'repeat_delta')
+  const others = patterns.filter((p) => p.kind !== 'repeat_delta')
+  // `[+-][\d.]+` swallowed the sentence-ending period, so "energy -0.11."
+  // parsed as -0.11. -> NaN and the summary read "from NaN to NaN". The number
+  // has to be a number, and a period is not a decimal point at the end of a
+  // sentence.
+  const deltaValues = repeatDeltas
+    .map((p) => {
+      const m = /energy\s+([+-]?\d+(?:\.\d+)?)/.exec(p.detail)
+      if (!m) return null
+      const v = Number(m[1])
+      return Number.isFinite(v) ? v : null
+    })
+    .filter((v): v is number => v !== null)
+  const deltaAll = deltaValues.length ? deltaValues : repeatDeltas.map(() => 0.3)
+
+  const grouped = [
+    ...others,
+    ...(repeatDeltas.length > 1 ? [{
+      id: '__repeat_delta_group__',
+      kind: 'repeat_delta',
+      title: repeatDeltas.length > 1
+        ? 'Later repeats differ from the first pass' : repeatDeltas[0].title,
+      // The sign belongs to the number being printed. It used to be read off
+      // the *last* delta and then applied to the *minimum*, so a set of deltas
+      // whose last one was positive printed "energy from +-0.13 to +0.10" — a
+      // double sign, from two different numbers.
+      detail: deltaValues.length
+        ? `${repeatDeltas.length} returns, energy from `
+          + `${fmtSigned(Math.min(...deltaAll))} to ${fmtSigned(Math.max(...deltaAll))} `
+          + 'against their first time through'
+        : `${repeatDeltas.length} returns differ measurably from their first pass`,
+      strength: Math.max(...repeatDeltas.map((p) => p.strength)),
+      evidence: repeatDeltas.flatMap((p) => p.evidence ?? []),
+      times: repeatDeltas.flatMap((p) => p.times ?? []),
+    }] : []),
+  ]
+
+  return (
+    <div>
+      {/* The heading lives here, not in the caller.
+
+          The caller wrote `song.patterns.length` into the title while the
+          grouping that decides how many rows are drawn lived here, so on
+          "DNA." the panel said **6** and showed **3**. Two numbers for one
+          list, one of them describing rows the reader cannot see. The count is
+          now `grouped.length` — the same array that is mapped below — so it
+          cannot drift from the list without the compiler noticing. */}
+      <h3>Arrangement patterns ({grouped.length})</h3>
+      <div className="tiny faint" style={{ marginBottom: 6 }}>
+        Computed from the measurements — these are facts, not opinions.
+      </div>
+      {grouped.map((p) => (
+        <div key={p.id}
+          className={`finding ${selected === p.id ? 'sel' : ''}`}
+          onClick={() => onSelect(selected === p.id ? null : p.id)}
+        >
+          <div className="ft">{p.title}</div>
+          <div className="fd">{p.detail}</div>
+          <div className="row" style={{ marginTop: 5, gap: 6 }}>
+            <div className="meter grow">
+              <div style={{
+                width: `${Math.round(p.strength * 100)}%`,
+                background: p.strength > 0.6 ? 'var(--ok)' : p.strength > 0.35 ? 'var(--warn)' : 'var(--fg-faint)',
+              }} />
+            </div>
+          </div>
+          {selected === p.id && (
+            <>
+              <EvidenceList items={p.evidence} compact />
+              {p.times.length > 0 && (
+                <div className="row wrap" style={{ gap: 4, marginTop: 5 }}>
+                  {p.times.slice(0, 12).map((t, i) => (
+                    <span key={i} className="chip" onClick={(e) => { e.stopPropagation(); onJump(t) }}>
+                      {fmtTime(t)}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      ))}
+    </div>
+  )
+}
