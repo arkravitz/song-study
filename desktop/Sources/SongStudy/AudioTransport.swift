@@ -27,7 +27,7 @@ import Foundation
     private var lastScrubSchedule=0.0
     init() {
         timer=Timer.scheduledTimer(withTimeInterval:1/60,repeats:true) { [weak self] _ in
-            Task { @MainActor in self?.tick() }
+            Task { @MainActor [weak self] in self?.tick() }
         }
     }
     func load(_ song:StudySong) throws {
