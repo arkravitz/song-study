@@ -53,10 +53,10 @@ struct WorkerFailure: LocalizedError {
                 while let edge=buffer.firstIndex(of:10) {
                     let line=buffer.prefix(upTo:edge);buffer.removeSubrange(...edge)
                     guard let object=try? JSONSerialization.jsonObject(with:line) as? [String:Any] else{continue}
-                    DispatchQueue.main.async { self?.receive(object) }
+                    DispatchQueue.main.async { [weak self] in self?.receive(object) }
                 }
             }
-            DispatchQueue.main.async { if self?.process?.processIdentifier==workerPID {self?.failed("The analysis worker stopped. Reopen the app to reconnect; completed songs and edits are saved.")} }
+            DispatchQueue.main.async { [weak self] in if self?.process?.processIdentifier==workerPID {self?.failed("The analysis worker stopped. Reopen the app to reconnect; completed songs and edits are saved.")} }
         }
     }
     func request<T:Decodable>(_ method:String,params:[String:Any]=[:],as:T.Type) async throws -> T {
